@@ -1,0 +1,128 @@
+name: Notify upstream releases
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: notify-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check latest upstream release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_REPOSITORY: ${{ github.repository }}
+          CURRENT_SHA: ${{ github.sha }}
+          UPSTREAM_REPOSITORY: shuaiplus/NodeWarden
+        run: |
+          set -euo pipefail
+
+          release_json=$(gh api "repos/$UPSTREAM_REPOSITORY/releases/latest")
+          latest_tag=$(jq -r '.tag_name // empty' <<< "$release_json")
+          release_url=$(jq -r '.html_url // empty' <<< "$release_json")
+          published_at=$(jq -r '.published_at // empty' <<< "$release_json")
+
+          if [[ ! "$latest_tag" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Invalid or missing upstream release tag: $latest_tag" >&2
+            exit 1
+          fi
+
+          current_version=$(
+            gh api "repos/$CURRENT_REPOSITORY/contents/package.json?ref=$CURRENT_SHA" --jq '.content' |
+              base64 --decode |
+              jq -r '.version // empty'
+          )
+          if [[ ! "$current_version" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Invalid or missing current package version: $current_version" >&2
+            exit 1
+          fi
+
+          latest_version=${latest_tag#v}
+          current_tag="v${current_version#v}"
+
+          find_release_issue() {
+            local state=$1
+            local marker=$2
+
+            gh api --paginate \
+              "repos/$CURRENT_REPOSITORY/issues?state=$state&per_page=100" |
+              jq -s -r --arg marker "$marker" '
+                add
+                | map(select(
+                    (has("pull_request") | not)
+                    and ((.body // "") | contains($marker))
+                  ))
+                | first
+                | .number // empty
+              '
+          }
+
+          if [[ "$current_version" == "$latest_version" ]]; then
+            current_marker="<!-- upstream-release:$latest_tag -->"
+            open_issue=$(find_release_issue open "$current_marker")
+            if [[ -n "$open_issue" ]]; then
+              gh api --method PATCH \
+                "repos/$CURRENT_REPOSITORY/issues/$open_issue" \
+                -f state=closed \
+                -f state_reason=completed >/dev/null
+              echo "Closed release reminder issue #$open_issue."
+            fi
+
+            {
+              echo "### Already on the latest upstream release"
+              echo "- Current version: \`$current_version\`"
+              echo "- Latest release: \`$latest_tag\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          issue_marker="<!-- upstream-release:$latest_tag -->"
+          existing_issue=$(find_release_issue all "$issue_marker")
+          if [[ -n "$existing_issue" ]]; then
+            {
+              echo "### Release reminder already exists"
+              echo "- Latest release: \`$latest_tag\`"
+              echo "- Issue: #$existing_issue"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          issue_title="Upstream release $latest_tag is available"
+          compare_url="https://github.com/$UPSTREAM_REPOSITORY/compare/$current_tag...$latest_tag"
+          issue_body=$(printf '%s\n' \
+            "$issue_marker" \
+            "检测到新的 NodeWarden 上游正式版本。" \
+            "" \
+            "- 当前 fork 版本：\`$current_version\`" \
+            "- 上游正式版本：[\`$latest_tag\`]($release_url)" \
+            "- 发布时间：\`$published_at\`" \
+            "- 版本差异：[\`$current_tag...$latest_tag\`]($compare_url)" \
+            "" \
+            "同步前请检查 Release Notes 和版本差异。确认后只同步 \`$latest_tag\`，不要同步上游 \`main\`。")
+
+          issue_url=$(
+            jq -n \
+              --arg title "$issue_title" \
+              --arg body "$issue_body" \
+              '{title: $title, body: $body}' |
+              gh api --method POST \
+                "repos/$CURRENT_REPOSITORY/issues" \
+                --input - \
+                --jq '.html_url'
+          )
+
+          {
+            echo "### Created upstream release reminder"
+            echo "- Latest release: \`$latest_tag\`"
+            echo "- Issue: $issue_url"
+          } >> "$GITHUB_STEP_SUMMARY"
